@@ -18,6 +18,11 @@ const (
 	// Beyond indicating the general state of a G, the G status
 	// acts like a lock on the goroutine's stack (and hence its
 	// ability to execute user code).
+
+	// G status除了指代G的状态，还可以作为goroutine的栈锁 （
+	// 因此有能力运行用户代码
+	//)
+
 	//
 	// If you add to this list, add to the list
 	// of "okay during garbage collection" status
@@ -150,10 +155,18 @@ const (
 // as fast as spin locks (just a few user-level instructions),
 // but on the contention path they sleep in the kernel.
 // A zeroed Mutex is unlocked (no need to initialize each lock).
+// 排他锁，在非竞争的条件下和自旋锁一样快，(只需要几行用户层指令)
+// 但是在竞争条件下会sleep在内核空间
+// 内存未初始化的Mutex是unlocked状态
 type mutex struct {
 	// Futex-based impl treats it as uint32 key,
 	// while sema-based impl as M* waitm.
 	// Used to be a union, but unions break precise GC.
+
+	// 基于futex的实现使用uint32作为key的类型
+	// 基于信号量的实现使用waitm类型的指针
+	// 之前是一个union, 但是使用union破坏GC的准确性
+
 	key uintptr
 }
 
@@ -174,9 +187,20 @@ type mutex struct {
 // wake up early, it must wait to call noteclear until it
 // can be sure that no other goroutine is calling
 // notewakeup.
-//
+
+// sleep和wakeup是实时事件
+// 在调用notesleep和notewakeup之前，必须调用noteclear初始化note对象
+// 然后只有一个线程可以调用notsleep，只有一个线程可以调用notewakeup (一次)
+// 当notewakeup调用，notesleep会返会。 未来的notesleep会立即返回，下一次的noteclear
+// 必须被调用当之前的notesleep返回。 e.g 这些约定禁止在notewakeup状态下调用noteclear
+// notetsleep就像notesleep一样，除了需要传递一个数字代表唤醒的时间(纳秒)尽管这个事件还没有
+// 发生， 如果一个goroutine使用notetsleep过早的唤醒，它必须等待noteclear调用直到它确认没有
+// 其他的goroutine调用了notewakeup
+
 // notesleep/notetsleep are generally called on g0,
 // notetsleepg is similar to notetsleep but is called on user g.
+
+//note结构跟mutex一样
 type note struct {
 	// Futex-based impl treats it as uint32 key,
 	// while sema-based impl as M* waitm.
@@ -210,25 +234,44 @@ func efaceOf(ep *interface{}) *eface {
 // which can lead to a half-executed write barrier that has marked the object
 // but not queued it. If the GC skips the object and completes before the
 // queuing can occur, it will incorrectly free the object.
-//
+
+// guintptr, muintptr, puintptr 这些指针变量用来绕过写屏障
+// 绕过写屏障尤其重要，当P运行的P释放掉的时候
+// 因为GC认为P已经停止且不会检测到这个意外的写屏障
+// 这也许会导致一个半执行的写屏障，产生一个GC已经标记但没有进入队列的对象，
+// 这个对象将会被不正确的释放
+
 // We tried using special assignment functions invoked only when not
 // holding a running P, but then some updates to a particular memory
 // word went through write barriers and some did not. This breaks the
 // write barrier shadow checking mode, and it is also scary: better to have
 // a word that is completely ignored by the GC than to have one for which
 // only a few updates are ignored.
-//
+
+// 我们用一个特殊的构造函数，这个函数只有在没有持有一个运行P的情况下才会被调用
+// 然后一些对特殊内存的更新操作会绕过写屏障，
+// 这打破了写屏障的阴影检测模式。后果很严重，最好有一个原语用来让GC忽略所有的更新而不是只有少数的更新被忽略
+
 // Gs and Ps are always reachable via true pointers in the
 // allgs and allp lists or (during allocation before they reach those lists)
 // from stack variables.
+
+// 通过allgs和allp队列中的true指针或者栈上变量(在分配过程中，还没添加到队列)，G和P总是可读的
 //
 // Ms are always reachable via true pointers either from allm or
 // freem. Unlike Gs and Ps we do free Ms, so it's important that
 // nothing ever hold an muintptr across a safe point.
 
+// M总是可读的，通过allm或者freem中的true指针。
+// M会释放，不像G和P，因此在跨越一个安全点(gc概念)的时候不要持有任何muinptr。
+
 // A guintptr holds a goroutine pointer, but typed as a uintptr
 // to bypass write barriers. It is used in the Gobuf goroutine state
 // and in scheduling lists that are manipulated without a P.
+
+// guintptr持有一个goroutine的指针， 用uintptr作为类型用来跳过写屏障，
+// 在Gobuf中用来查看goruntine相关状态，在调度器的列表中操作goruntine即使不在P中
+
 //
 // The Gobuf.g goroutine pointer is almost always updated by assembly code.
 // In one of the few places it is updated by Go code - func save - it must be
@@ -236,6 +279,11 @@ func efaceOf(ep *interface{}) *eface {
 // Instead of figuring out how to emit the write barriers missing in the
 // assembly manipulation, we change the type of the field to uintptr,
 // so that it does not require write barriers at all.
+
+// Gobuf.g 是goroutine的指针，它的更新操作几乎都是由汇编来完成，只有少部分是go
+// 即func save，必须用传递一个uintptr用来绕过写屏障，一个糟糕时机的产生的写屏障。
+// 我们使用这种机制来代替在汇编中编写跳过写屏障的代码，这样编译器就不会产生写屏障的代码了。
+
 //
 // Goroutine structs are published in the allg list and never freed.
 // That will keep the goroutine structs from being collected.
@@ -245,6 +293,13 @@ func efaceOf(ep *interface{}) *eface {
 // so I can't see them ever moving. If we did want to start moving data
 // in the GC, we'd need to allocate the goroutine structs from an
 // alternate arena. Using guintptr doesn't make that problem any worse.
+
+// Goroutine 结构会添加到allg列表中且不会释放，这使得Goroutine结构不会被GC收集
+// Gobuf.g不会仅包含goroutine的引用，首先是发表的在allg中的goroutine，goroutine的指针也会保存
+// 在GC不可见的区域，比如TLS (thread local storage), 所以你不会看到它的地址发生移动，
+// 如果我们希望让gc对数据重排，我们需要从交替区分配这个goroutine的结构。
+// guintptr的使用不会让这个问题变得更严重
+
 type guintptr uintptr
 
 //go:nosplit
@@ -260,6 +315,9 @@ func (gp *guintptr) cas(old, new guintptr) bool {
 
 // setGNoWB performs *gp = new without a write barrier.
 // For times when it's impractical to use a guintptr.
+// setGNoWB 设置gp的新值，没有写屏障
+// 适用于一些不能使用guintptr的时候
+
 //go:nosplit
 //go:nowritebarrier
 func setGNoWB(gp **g, new *g) {
@@ -275,7 +333,6 @@ func (pp puintptr) ptr() *p { return (*p)(unsafe.Pointer(pp)) }
 func (pp *puintptr) set(p *p) { *pp = puintptr(unsafe.Pointer(p)) }
 
 // muintptr is a *m that is not tracked by the garbage collector.
-//
 // Because we do free Ms, there are some additional constrains on
 // muintptrs:
 //
@@ -283,6 +340,12 @@ func (pp *puintptr) set(p *p) { *pp = puintptr(unsafe.Pointer(p)) }
 //
 // 2. Any muintptr in the heap must be owned by the M itself so it can
 //    ensure it is not in use when the last true *m is released.
+
+// muintptr是m结构的指针,不会被gc追踪。因为我们会释放M，关于muintptr有如下约束。
+// 1. 局部跨越一个安全点时不要持有muintptr
+// 2. 任何堆上的muintptr必须被M自身持有,因此它能够保证之前的m释放时这个值没有被使用
+//
+
 type muintptr uintptr
 
 //go:nosplit
@@ -299,6 +362,9 @@ func setMNoWB(mp **m, new *m) {
 	(*muintptr)(unsafe.Pointer(mp)).set(new)
 }
 
+/*
+	gobuf包含帧栈的指针，上下文结构指针，执行g的指针，推测用于goroutine的上下文切换
+*/
 type gobuf struct {
 	// The offsets of sp, pc, and g are known to (hard-coded in) libmach.
 	//
@@ -312,13 +378,21 @@ type gobuf struct {
 	// and restores it doesn't need write barriers. It's still
 	// typed as a pointer so that any other writes from Go get
 	// write barriers.
+
+	//sp,pc 和g的偏移量在libmach中硬编码
+	// ctxt 关于GC的用法是不寻常的： 它可能是一个堆上分配的函数地址, 因此GC
+	// 需要跟踪它，但是它需要被汇编设置和清零, 由此很难设置写屏障。不过ctxt
+	// 确实拥有一个物理寄存器来存储，且仅在gobuf和寄存器之间交换数据，因此当扫描
+	// 栈数据时，我们将它看作根，这意味使用汇编对它saves或restores不需要写屏障。
+	// 它仍使用指针类型因此任何其他写操作会获得写屏障
+
 	sp   uintptr
 	pc   uintptr
 	g    guintptr
 	ctxt unsafe.Pointer
 	ret  sys.Uintreg
 	lr   uintptr
-	bp   uintptr // for GOEXPERIMENT=framepointer
+	bp   uintptr // for GOEXPERIMENT=framepointer 指向帧的指针，ebp的值
 }
 
 // sudog represents a g in a wait list, such as for sending/receiving
@@ -331,15 +405,31 @@ type gobuf struct {
 //
 // sudogs are allocated from a special pool. Use acquireSudog and
 // releaseSudog to allocate and free them.
+
+// sudog 代表g的等待执行队列，例如在阻塞在channel读写上。
+// sudog是必须的因为 g<->同步对象的关系是多对多，同一个g可以在许多等待列表上
+// 所以一个g可能有多个sudogs，并且多个g也可能在同一个同步对象上等待,因此
+// 一个对象可能有多个sudog
+// sudog从一个特殊的池中分配， 使用指定的方法分配和销毁
+
+/*
+	sudog是一个双向链表，channel维护两个sudog结构，分别代表发送和接收的等待队列，sudog本身不含
+	锁，依赖channel中定义的排他锁
+*/
 type sudog struct {
 	// The following fields are protected by the hchan.lock of the
 	// channel this sudog is blocking on. shrinkstack depends on
 	// this for sudogs involved in channel ops.
 
+	// hchan.lock提供的阻塞机制保护了其他的域。栈的收缩依赖这个当sudogs涉及channel操作。
 	g *g
 
 	// isSelect indicates g is participating in a select, so
 	// g.selectDone must be CAS'd to win the wake-up race.
+
+	// isSelect标识g是否在调用select,如果是的话，只有通过cas操作设置了g.selectDone
+	// 的家伙才会赢得竞争
+
 	isSelect bool
 	next     *sudog
 	prev     *sudog
@@ -349,6 +439,8 @@ type sudog struct {
 	// For channels, waitlink is only accessed by g.
 	// For semaphores, all fields (including the ones above)
 	// are only accessed when holding a semaRoot lock.
+
+	// 下列域不会被并发访问
 
 	acquiretime int64
 	releasetime int64
@@ -379,6 +471,9 @@ type wincallbackcontext struct {
 // Stack describes a Go execution stack.
 // The bounds of the stack are exactly [lo, hi),
 // with no implicit data structures on either side.
+
+// Go运行栈结构定义
+// 栈的边界定义是精确的[lo,hi),两侧没有隐含的数据结构
 type stack struct {
 	lo uintptr
 	hi uintptr
@@ -392,6 +487,13 @@ type g struct {
 	// stackguard1 is the stack pointer compared in the C stack growth prologue.
 	// It is stack.lo+StackGuard on g0 and gsignal stacks.
 	// It is ~0 on other goroutine stacks, to trigger a call to morestackc (and crash).
+
+	// stackguard0指向栈的指针在栈增长的时候用于比较
+	// 通常是stack.lo+StackGuard，但可以是StackPreempt用来触发一个抢占
+	// stackguard1指向栈的指针在C的栈增长时用于比较
+	// 它的值stack.lo+StackGuard在g0上或gsignal stacks上。
+	// 如果其他goroutine栈上的这个值近似为零，会标记一个morestackc的系统调用并崩溃
+
 	stack       stack   // offset known to runtime/cgo
 	stackguard0 uintptr // offset known to liblink
 	stackguard1 uintptr // offset known to liblink
@@ -406,7 +508,7 @@ type g struct {
 	param          unsafe.Pointer // passed parameter on wakeup
 	atomicstatus   uint32
 	stackLock      uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
-	goid           int64
+	goid           int64  //goroutine id
 	schedlink      guintptr
 	waitsince      int64      // approx time when the g become blocked
 	waitreason     waitReason // if status==Gwaiting
