@@ -25,6 +25,14 @@ var modinfo string
 // P - processor, a resource that is required to execute Go code.
 //     M must have an associated P to execute Go code, however it can be
 //     blocked or in a syscall w/o an associated P.
+
+// Goroutine 调度器
+// 调度器的工作就是将准备运行的goroutine分布到工作线程上
+// 主要概念:
+// G - goroutine
+// M - 工作线程或机器
+// P - 处理器，一类资源被请求用于执行go代码
+// M 必须关联一个P来执行go代码， 尽管如此当没有关连P的时候它仍可被系统挂起或执行系统调用。
 //
 // Design doc at https://golang.org/s/go11sched.
 
@@ -37,6 +45,13 @@ var modinfo string
 // (2) for optimal thread management we would need to know the future (don't park
 // a worker thread when a new goroutine will be readied in near future).
 //
+// 工作线程的挂起和恢复
+// 我们需要在保持足够多的工作线程去最大化利用硬件的并行能力和挂起过剩的工作线程来节约cpu以及电费之间做平衡
+// 完成这点不简单，理由有两个
+// 1） 实现分布的调度器状态的是有意的 （举例来说,一个P拥有一个工作队列Gs)
+// 因此快速的推断全局的计算是不可行的
+// 2） 为了优化线程管理我们需要预知未来（不暂停工作线程为了加载即将产生的新的goroutine）
+
 // Three rejected approaches that would work badly:
 // 1. Centralize all scheduler state (would inhibit scalability).
 // 2. Direct goroutine handoff. That is, when we ready a new goroutine and there
@@ -50,6 +65,12 @@ var modinfo string
 //    unparking as the additional threads will instantly park without discovering
 //    any work to do.
 //
+// 三个已经否决的方案
+// 1. 中心化调度器状态 （影响可伸缩性）
+// 2. 通过goroutine的传递, 当一个新的goroutine准备好并且有一个空闲P的时候，恢复一个挂起的线程然后把这个线程
+// 和goroutine传给这个P, 这会导致线程的状态抖动。 假如这个goroutine很快的完成工作并退出，我们还需要把工作线程
+// 挂起， 同时这将破坏计算的局部性（我们希望有存在依赖关系的goroutine在同一个工作线程上执行）并且增加了延时
+
 // The current approach:
 // We unpark an additional thread when we ready a goroutine if (1) there is an
 // idle P and there are no "spinning" worker threads. A worker thread is considered
@@ -66,6 +87,17 @@ var modinfo string
 // thread finds work and stops spinning, it must unpark a new spinning thread.
 // This approach smooths out unjustified spikes of thread unparking,
 // but at the same time guarantees eventual maximal CPU parallelism utilization.
+
+// 目前的实现方案
+// 当有一个goroutine准备执行时我们恢复运行一个新的线程，当且仅当
+// 1） 有一个空闲的P,并且没有正在自旋的工作线程。当一个工作线程完成了自己的工作并且没有从
+// 全局的queue或者netpoller中获取到新的工作时就可被看作是自旋的.
+// 我们不会主动传递G，因此工作线程初始状态都是自旋的，自旋线程在挂起之前会尝试从其他的P中偷取G
+// 如果成功拿到了G就会解除自旋状态进入执行，否则把自己挂起。
+// 如果存在至少一个自旋的线程，我们不会恢复一个新线程用来执行新的goroutine。作为补偿，如果上一个自旋线程
+// 获取了G解除自旋， 调度器会恢复一个线程进入自旋。
+// 这样的实现平滑了不公平的线程挂起算法，与此同时优化了对多核处理器的利用
+
 //
 // The main implementation complication is that we need to be very careful during
 // spinning->non-spinning thread transition. This transition can race with submission
@@ -78,6 +110,17 @@ var modinfo string
 // Note that all this complexity does not apply to global run queue as we are not
 // sloppy about thread unparking when submitting to global queue. Also see comments
 // for nmspinning manipulation.
+
+// 主要实现的复杂性是由于我们必须小心的处理线程自旋到解除自旋状态之间的转换，
+// 提交新的goroutine可能会跟这种转换产生竞争，两者都需要恢复一个挂起的工作线程。
+// 如果他们都失败,可能会损失一半CPU利用率。
+// 一个goroutine准备执行的标准流程是，提交一个G到局部的工作队列, 使用StoreLoad类型的内存屏障
+// 检察调度器中自旋的线程数量。
+// 一个解除自旋的流程是, 减少nmspinning，storeLoad内存屏障，检察所有P的工作队列有没有可用的G
+
+// #StoreLoad-style memory barrier
+// 注: Most CPU architectures will re-order stores-load operations
+// https://stackoverflow.com/questions/27475025/why-is-a-store-load-barrier-considered-expensive
 
 var (
 	m0           m
