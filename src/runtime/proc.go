@@ -184,6 +184,8 @@ func main() {
 	// Those can arrange for main.main to run in the main thread
 	// by calling runtime.LockOSThread during initialization
 	// to preserve the lock.
+
+	//线程锁，防止当前goroutine调度到其他线程
 	lockOSThread()
 
 	if g.m != &m0 {
